@@ -1,0 +1,146 @@
+const express = require('express');
+const router = express.Router();
+const { getPool, sql } = require('../models/db');
+const { stringify } = require('csv-stringify/sync');
+const axios = require('axios');
+
+// GET /api/results/:quizId  — full results JSON
+router.get('/:quizId', async (req, res) => {
+  try {
+    const pool = getPool();
+
+    const summary = await pool.request()
+      .input('quiz_id', sql.UniqueIdentifier, req.params.quizId)
+      .query(`
+        SELECT
+          q.title,
+          COUNT(DISTINCT p.id)                AS total_participants,
+          COUNT(a.id)                          AS total_answers,
+          SUM(CAST(a.is_correct AS INT))       AS correct_answers,
+          CAST(
+            100.0 * SUM(CAST(a.is_correct AS INT)) / NULLIF(COUNT(a.id),0)
+          AS DECIMAL(5,1))                     AS accuracy_pct
+        FROM Quizzes q
+        LEFT JOIN Participants p ON p.quiz_id = q.id
+        LEFT JOIN Answers a ON a.participant_id = p.id
+        WHERE q.id = @quiz_id
+        GROUP BY q.title
+      `);
+
+    const perQuestion = await pool.request()
+      .input('quiz_id', sql.UniqueIdentifier, req.params.quizId)
+      .query(`
+        SELECT
+          qn.id, qn.text, qn.options, qn.correct_idx,
+          COUNT(a.id)                                        AS total_votes,
+          SUM(CAST(a.is_correct AS INT))                    AS correct_votes
+        FROM Questions qn
+        LEFT JOIN Answers a ON a.question_id = qn.id
+        WHERE qn.quiz_id = @quiz_id
+        GROUP BY qn.id, qn.text, qn.options, qn.correct_idx, qn.order_num
+        ORDER BY qn.order_num
+      `);
+
+    const breakdown = await pool.request()
+      .input('quiz_id', sql.UniqueIdentifier, req.params.quizId)
+      .query(`
+        SELECT qn.id AS question_id, a.chosen_idx, COUNT(*) AS votes
+        FROM Answers a
+        JOIN Questions qn ON qn.id = a.question_id
+        WHERE qn.quiz_id = @quiz_id
+        GROUP BY qn.id, a.chosen_idx
+      `);
+
+    const questions = perQuestion.recordset.map(q => ({
+      id: q.id,
+      text: q.text,
+      options: JSON.parse(q.options),
+      correctIdx: q.correct_idx,
+      totalVotes: q.total_votes,
+      correctVotes: q.correct_votes,
+      votesByOption: breakdown.recordset
+        .filter(b => b.question_id === q.id)
+        .reduce((acc, b) => { acc[b.chosen_idx] = b.votes; return acc; }, {})
+    }));
+
+    res.json({
+      summary: summary.recordset[0],
+      questions
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/results/:quizId/export  — CSV export
+router.get('/:quizId/export', async (req, res) => {
+  try {
+    const pool = getPool();
+    const rows = await pool.request()
+      .input('quiz_id', sql.UniqueIdentifier, req.params.quizId)
+      .query(`
+        SELECT
+          p.name        AS participant_name,
+          p.email,
+          p.joined_at,
+          qn.text       AS question,
+          JSON_VALUE(qn.options, CONCAT('$[', a.chosen_idx, ']')) AS answer_given,
+          JSON_VALUE(qn.options, CONCAT('$[', qn.correct_idx, ']')) AS correct_answer,
+          CASE WHEN a.is_correct = 1 THEN 'Yes' ELSE 'No' END AS is_correct,
+          a.answered_at
+        FROM Participants p
+        JOIN Answers a       ON a.participant_id = p.id
+        JOIN Questions qn    ON qn.id = a.question_id
+        WHERE p.quiz_id = @quiz_id
+        ORDER BY p.name, qn.order_num
+      `);
+
+    const csv = stringify(rows.recordset, { header: true });
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="quiz_results_${req.params.quizId}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/results/:quizId/notify  — send webhook notification
+router.post('/:quizId/notify', async (req, res) => {
+  const webhookUrl = process.env.WEBHOOK_URL;
+  if (!webhookUrl) return res.status(400).json({ error: 'WEBHOOK_URL not configured' });
+
+  try {
+    const pool = getPool();
+    const summary = await pool.request()
+      .input('quiz_id', sql.UniqueIdentifier, req.params.quizId)
+      .query(`
+        SELECT q.title, COUNT(DISTINCT p.id) AS total_participants,
+          CAST(100.0 * SUM(CAST(a.is_correct AS INT)) / NULLIF(COUNT(a.id),0) AS DECIMAL(5,1)) AS accuracy_pct
+        FROM Quizzes q
+        LEFT JOIN Participants p ON p.quiz_id = q.id
+        LEFT JOIN Answers a ON a.participant_id = p.id
+        WHERE q.id = @quiz_id
+        GROUP BY q.title
+      `);
+
+    const data = summary.recordset[0];
+
+    // Send to webhook (compatible Slack, Teams, Discord, custom)
+    await axios.post(webhookUrl, {
+      text: `📊 Quiz Results: *${data.title}*`,
+      attachments: [{
+        color: '#1D9E75',
+        fields: [
+          { title: 'Participants', value: data.total_participants, short: true },
+          { title: 'Accuracy', value: `${data.accuracy_pct}%`, short: true }
+        ]
+      }]
+    });
+
+    res.json({ message: 'Notification sent successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;

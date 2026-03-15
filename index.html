@@ -1,0 +1,265 @@
+// ── State ──────────────────────────────────────────────────
+const state = {
+  socket: null,
+  quizId: null,
+  participantId: null,
+  questions: [],
+  currentQ: 0,
+  answers: [],
+  timerInterval: null,
+  timeLeft: 30
+};
+
+// ── Socket.IO ──────────────────────────────────────────────
+function initSocket() {
+  state.socket = io();
+
+  state.socket.on('connect', () => {
+    document.querySelector('.dot').classList.add('connected');
+    document.getElementById('status-text').textContent = 'Connecté';
+  });
+
+  state.socket.on('disconnect', () => {
+    document.querySelector('.dot').classList.remove('connected');
+    document.getElementById('status-text').textContent = 'Déconnecté';
+  });
+
+  state.socket.on('answer_update', ({ questionId, stats }) => {
+    updateLiveBars(questionId, stats);
+  });
+
+  state.socket.on('participant_joined', ({ name, total }) => {
+    console.log(`👤 ${name} joined. Total: ${total}`);
+    const el = document.getElementById('d-participants');
+    if (el) el.textContent = total;
+  });
+}
+
+// ── Screens ────────────────────────────────────────────────
+function showScreen(name) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(`screen-${name}`).classList.add('active');
+}
+
+// ── Load quiz list ─────────────────────────────────────────
+async function loadQuizList() {
+  try {
+    const res = await fetch('/api/quiz');
+    const quizzes = await res.json();
+    const container = document.getElementById('quiz-list');
+
+    if (!quizzes.length) {
+      container.innerHTML = '<p style="text-align:center;color:var(--muted);padding:2rem">Aucun quiz actif pour le moment.</p>';
+      return;
+    }
+
+    container.innerHTML = quizzes.map(q => `
+      <div class="quiz-card" onclick="selectQuiz('${q.id}', '${escHtml(q.title)}', '${escHtml(q.description || '')}')">
+        <div>
+          <div class="quiz-card-title">${escHtml(q.title)}</div>
+          <div class="quiz-card-meta">Créé le ${new Date(q.created_at).toLocaleDateString('fr-FR')}</div>
+        </div>
+        <div class="quiz-card-arrow">→</div>
+      </div>
+    `).join('');
+  } catch (err) {
+    document.getElementById('quiz-list').innerHTML = '<p style="color:var(--danger);text-align:center">Erreur de chargement</p>';
+  }
+}
+
+// ── Select quiz → join screen ──────────────────────────────
+function selectQuiz(id, title, desc) {
+  state.quizId = id;
+  document.getElementById('join-quiz-title').textContent = title;
+  document.getElementById('join-quiz-desc').textContent = desc || 'Rejoins ce quiz et réponds en temps réel.';
+  showScreen('join');
+}
+
+// ── Join quiz ──────────────────────────────────────────────
+async function joinQuiz() {
+  const name = document.getElementById('input-name').value.trim();
+  const email = document.getElementById('input-email').value.trim();
+
+  if (!name) { alert('Entre ton prénom pour continuer.'); return; }
+
+  try {
+    const res = await fetch(`/api/quiz/${state.quizId}/join`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error);
+
+    state.participantId = data.participantId;
+
+    // Load quiz questions
+    const qRes = await fetch(`/api/quiz/${state.quizId}`);
+    const quiz = await qRes.json();
+    state.questions = quiz.questions;
+    state.currentQ = 0;
+    state.answers = [];
+
+    // Join socket room
+    state.socket.emit('join_quiz', { quizId: state.quizId, participantName: name });
+
+    showScreen('quiz');
+    renderQuestion();
+  } catch (err) {
+    alert('Erreur: ' + err.message);
+  }
+}
+
+// ── Render question ────────────────────────────────────────
+function renderQuestion() {
+  const q = state.questions[state.currentQ];
+  if (!q) { showResults(); return; }
+
+  const total = state.questions.length;
+  const pct = Math.round((state.currentQ / total) * 100);
+
+  document.getElementById('progress-fill').style.width = pct + '%';
+  document.getElementById('q-counter').textContent = `Question ${state.currentQ + 1} / ${total}`;
+  document.getElementById('q-text').textContent = q.text;
+
+  const letters = ['A', 'B', 'C', 'D'];
+  document.getElementById('options-container').innerHTML = q.options.map((opt, i) => `
+    <div class="option" id="opt-${i}" onclick="submitAnswer(${i})">
+      <div class="option-letter">${letters[i]}</div>
+      <span>${escHtml(opt)}</span>
+    </div>
+  `).join('');
+
+  document.getElementById('answer-feedback').className = 'feedback hidden';
+
+  startTimer();
+}
+
+// ── Timer ──────────────────────────────────────────────────
+function startTimer() {
+  clearInterval(state.timerInterval);
+  state.timeLeft = 30;
+  updateTimerDisplay();
+
+  state.timerInterval = setInterval(() => {
+    state.timeLeft--;
+    updateTimerDisplay();
+    if (state.timeLeft <= 0) {
+      clearInterval(state.timerInterval);
+      autoSubmit();
+    }
+  }, 1000);
+}
+
+function updateTimerDisplay() {
+  const el = document.getElementById('q-timer');
+  el.textContent = `⏱ ${state.timeLeft}s`;
+  el.className = 'timer' + (state.timeLeft <= 5 ? ' urgent' : '');
+}
+
+function autoSubmit() {
+  const q = state.questions[state.currentQ];
+  state.answers.push({ questionId: q.id, chosen: -1, correct: false });
+  showFeedback(false, 'Temps écoulé !');
+  setTimeout(nextQuestion, 1500);
+}
+
+// ── Submit answer ──────────────────────────────────────────
+async function submitAnswer(idx) {
+  clearInterval(state.timerInterval);
+
+  const q = state.questions[state.currentQ];
+  document.querySelectorAll('.option').forEach(o => o.classList.add('disabled'));
+  document.getElementById(`opt-${idx}`).classList.add('selected');
+
+  try {
+    const res = await fetch(`/api/quiz/${state.quizId}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ questionId: q.id, chosenIdx: idx })
+    });
+    const data = await res.json();
+
+    document.getElementById(`opt-${idx}`).classList.remove('selected');
+    document.getElementById(`opt-${idx}`).classList.add(data.isCorrect ? 'correct' : 'wrong');
+
+    state.answers.push({ questionId: q.id, chosen: idx, correct: data.isCorrect });
+    showFeedback(data.isCorrect, data.message);
+    setTimeout(nextQuestion, 1800);
+  } catch (err) {
+    nextQuestion();
+  }
+}
+
+function showFeedback(correct, msg) {
+  const el = document.getElementById('answer-feedback');
+  el.textContent = msg;
+  el.className = `feedback ${correct ? 'correct' : 'wrong'}`;
+}
+
+function nextQuestion() {
+  state.currentQ++;
+  renderQuestion();
+}
+
+// ── Results ────────────────────────────────────────────────
+async function showResults() {
+  showScreen('results');
+
+  const correct = state.answers.filter(a => a.correct).length;
+  const total = state.answers.length;
+  const pct = total ? Math.round((correct / total) * 100) : 0;
+
+  document.getElementById('score-value').textContent = pct + '%';
+  document.getElementById('result-title').textContent = pct >= 80 ? '🎉 Excellent !' : pct >= 50 ? '👍 Bien joué !' : '📚 Continue à apprendre !';
+  document.getElementById('result-sub').textContent = `${correct} bonne(s) réponse(s) sur ${total}`;
+
+  // Animate score circle color
+  const circle = document.getElementById('score-circle');
+  if (pct >= 80) circle.style.borderColor = 'var(--success)';
+  else if (pct >= 50) circle.style.borderColor = 'var(--accent2)';
+  else circle.style.borderColor = 'var(--danger)';
+
+  // Load leaderboard
+  try {
+    const res = await fetch(`/api/participant/quiz/${state.quizId}/leaderboard`);
+    const leaders = await res.json();
+    renderLeaderboard(leaders);
+  } catch (e) {}
+}
+
+function renderLeaderboard(data) {
+  const el = document.getElementById('leaderboard');
+  if (!data.length) { el.style.display = 'none'; return; }
+
+  el.innerHTML = `
+    <div class="leaderboard-title">🏆 Classement</div>
+    ${data.map((p, i) => `
+      <div class="lb-row">
+        <div class="lb-rank ${i < 3 ? 'top' : ''}">${i < 3 ? ['🥇','🥈','🥉'][i] : i+1}</div>
+        <div class="lb-name">${escHtml(p.name)}</div>
+        <div class="lb-score">${p.score_pct}%</div>
+      </div>
+    `).join('')}
+  `;
+}
+
+function exportResults() {
+  if (state.quizId) window.open(`/api/results/${state.quizId}/export`, '_blank');
+}
+
+function updateLiveBars(questionId, stats) {
+  // Could be extended to show live vote bars
+  console.log('Live update:', questionId, stats);
+}
+
+// ── Helpers ────────────────────────────────────────────────
+function escHtml(str) {
+  const d = document.createElement('div');
+  d.appendChild(document.createTextNode(str || ''));
+  return d.innerHTML;
+}
+
+// ── Init ───────────────────────────────────────────────────
+initSocket();
+loadQuizList();
